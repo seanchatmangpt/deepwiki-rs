@@ -140,15 +140,15 @@ pub enum Commands {
         #[arg(long)]
         receipt: Option<PathBuf>,
 
-        /// Repository identity. Defaults to GITHUB_REPOSITORY, otherwise UNKNOWN.
+        /// Repository identity. Defaults to GITHUB_REPOSITORY; otherwise required.
         #[arg(long)]
         repository: Option<String>,
 
-        /// Exact revision identity. Defaults to GITHUB_SHA, otherwise UNKNOWN.
+        /// Exact revision identity. Defaults to GITHUB_SHA; otherwise required.
         #[arg(long)]
         revision: Option<String>,
 
-        /// Optional Open Ontologies binary. When supplied, validation is mandatory and fail-closed.
+        /// Optional Open Ontologies binary. Performs fail-closed RDF/ontology validation; SHACL admission remains separate.
         #[arg(long)]
         open_ontologies_bin: Option<PathBuf>,
     },
