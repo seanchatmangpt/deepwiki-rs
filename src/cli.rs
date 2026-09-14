@@ -125,6 +125,33 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Compile Rustdoc JSON into deterministic RDF semantic documentation.
+    SemanticDocs {
+        /// Rustdoc JSON input. Generate with cargo +nightly rustdoc -- --output-format json -Z unstable-options.
+        #[arg(long)]
+        rustdoc_json: PathBuf,
+
+        /// TriG output path containing source and documentation named graphs.
+        #[arg(short, long, default_value = "semantic-docs.trig")]
+        output: PathBuf,
+
+        /// JSON receipt path. Defaults to <output>.receipt.json.
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+
+        /// Repository identity. Defaults to GITHUB_REPOSITORY; otherwise required.
+        #[arg(long)]
+        repository: Option<String>,
+
+        /// Exact revision identity. Defaults to GITHUB_SHA; otherwise required.
+        #[arg(long)]
+        revision: Option<String>,
+
+        /// Optional Open Ontologies binary. Performs fail-closed RDF/ontology validation; SHACL admission remains separate.
+        #[arg(long)]
+        open_ontologies_bin: Option<PathBuf>,
+    },
 }
 
 impl Args {
@@ -189,10 +216,8 @@ impl Args {
         }
         if let Some(llm_api_base_url) = self.llm_api_base_url {
             config.llm.api_base_url = llm_api_base_url;
-        } else {
-            if config.llm.provider == LLMProvider::Ollama {
-                config.llm.api_base_url = "http://localhost:11434".to_owned();
-            }
+        } else if config.llm.provider == LLMProvider::Ollama {
+            config.llm.api_base_url = "http://localhost:11434".to_owned();
         }
         if let Some(llm_api_key) = self.llm_api_key {
             config.llm.api_key = llm_api_key;
