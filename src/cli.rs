@@ -152,6 +152,13 @@ pub enum Commands {
         #[arg(long)]
         open_ontologies_bin: Option<PathBuf>,
     },
+
+    /// Replay a semantic-docs receipt: re-hash input/output and recompile byte-for-byte.
+    SemanticDocsReplay {
+        /// Receipt written by `semantic-docs` (schema litho.semantic-documentation.receipt/v2).
+        #[arg(long)]
+        receipt: PathBuf,
+    },
 }
 
 impl Args {

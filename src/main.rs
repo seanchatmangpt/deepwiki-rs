@@ -61,6 +61,11 @@ async fn handle_subcommand(command: cli::Commands, config_path: Option<std::path
             );
             Ok(())
         }
+        cli::Commands::SemanticDocsReplay { receipt } => {
+            let semantic::ReplayVerdict::Replayed { output_sha256 } = semantic::replay(&receipt)?;
+            println!("semantic documentation replay: REPLAYED output={}", output_sha256);
+            Ok(())
+        }
     }
 }
 
