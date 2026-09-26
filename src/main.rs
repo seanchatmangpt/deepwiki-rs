@@ -10,6 +10,7 @@ mod i18n;
 mod integrations;
 mod llm;
 mod memory;
+mod semantic;
 mod types;
 mod utils;
 
@@ -32,6 +33,47 @@ async fn handle_subcommand(command: cli::Commands, config_path: Option<std::path
     match command {
         cli::Commands::SyncKnowledge { config, force } => {
             sync_knowledge(config.or(config_path), force).await
+        }
+        cli::Commands::SemanticDocs {
+            rustdoc_json,
+            output,
+            receipt,
+            repository,
+            revision,
+            open_ontologies_bin,
+        } => {
+            let receipt = semantic::run(semantic::SemanticDocsOptions {
+                rustdoc_json,
+                output,
+                receipt,
+                repository,
+                revision,
+                open_ontologies_bin,
+            })?;
+            println!(
+                "semantic documentation: items={} documented={} references={} spans={} standing={} authority={}",
+                receipt.item_count,
+                receipt.documented_item_count,
+                receipt.reference_count,
+                receipt.source_span_count,
+                receipt.standing,
+                receipt.authority
+            );
+            Ok(())
+        }
+        cli::Commands::SemanticDocsReplay {
+            receipt,
+            open_ontologies_bin,
+        } => {
+            let semantic::ReplayVerdict::Replayed {
+                output_sha256,
+                validation,
+            } = semantic::replay(&receipt, open_ontologies_bin.as_deref())?;
+            println!(
+                "semantic documentation replay: REPLAYED output={} validation={:?}",
+                output_sha256, validation
+            );
+            Ok(())
         }
     }
 }
