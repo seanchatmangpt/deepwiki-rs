@@ -7,7 +7,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SDOC: &str = "https://ggen.dev/ontology/semantic-documentation#";
-const RECEIPT_SCHEMA: &str = "litho.semantic-documentation.receipt/v2";
+const RECEIPT_SCHEMA: &str = "litho.semantic-documentation.receipt/v3";
+const EXTRACTOR: &str = "rustdoc-json";
+const AUTHORITY: &str = "none";
+const STANDING: &str = "PARTIAL_ALIVE";
+const VALIDATOR_ARGV_PREFIX: [&str; 3] = ["ontology", "validate", "--input"];
+const FALSIFIERS: [&str; 11] = [
+    "repository or exact revision identity is absent",
+    "Rustdoc JSON lacks format_version or index",
+    "semantic graph cannot be written",
+    "revision is not a full 40- or 64-hex commit id (symbolic refs are stale subjects)",
+    "output or receipt path aliases the input or each other (same path or same file)",
+    "requested Open Ontologies validation exits non-zero, cannot start, or reports ok != true",
+    "same input/repository/revision produces different TriG bytes",
+    "replay: input or output sha256 differs from this receipt",
+    "replay: any receipt field differs from the value recomputed from the input",
+    "replay: a validated=true claim is not reproduced by re-executing the validator",
+    "emitted semantic subject diverges from semantic-documentation-contract vocabulary",
+];
 
 #[derive(Debug, Clone)]
 pub struct SemanticDocsOptions {
@@ -39,6 +56,28 @@ pub struct SemanticDocumentationReceipt {
     pub validation: ValidationReceipt,
     pub falsifiers: Vec<&'static str>,
 }
+
+/// Top-level keys of a v3 receipt. Replay refuses any other key, so a forged
+/// field cannot ride along on a receipt that otherwise replays.
+const RECEIPT_KEYS: [&str; 17] = [
+    "schema_version",
+    "extractor",
+    "rustdoc_format_version",
+    "repository",
+    "revision",
+    "input",
+    "input_sha256",
+    "output",
+    "output_sha256",
+    "item_count",
+    "documented_item_count",
+    "reference_count",
+    "source_span_count",
+    "authority",
+    "standing",
+    "validation",
+    "falsifiers",
+];
 
 #[derive(Debug, Serialize)]
 pub struct ValidationReceipt {
@@ -129,32 +168,22 @@ pub fn run(options: SemanticDocsOptions) -> Result<SemanticDocumentationReceipt>
     // ALIVE standing here.
     let receipt = SemanticDocumentationReceipt {
         schema_version: RECEIPT_SCHEMA,
-        extractor: "rustdoc-json",
+        extractor: EXTRACTOR,
         rustdoc_format_version: format_version,
         repository,
         revision,
-        input: options.rustdoc_json.display().to_string(),
+        input: receipt_relative(&options.rustdoc_json, &receipt_path),
         input_sha256,
-        output: options.output.display().to_string(),
+        output: receipt_relative(&options.output, &receipt_path),
         output_sha256,
         item_count: counts.item_count,
         documented_item_count: counts.documented_item_count,
         reference_count: counts.reference_count,
         source_span_count: counts.source_span_count,
-        authority: "none",
-        standing: "PARTIAL_ALIVE",
+        authority: AUTHORITY,
+        standing: STANDING,
         validation,
-        falsifiers: vec![
-            "repository or exact revision identity is absent",
-            "Rustdoc JSON lacks format_version or index",
-            "semantic graph cannot be written",
-            "revision is not a full 40- or 64-hex commit id (symbolic refs are stale subjects)",
-            "output or receipt path aliases the input or each other",
-            "requested Open Ontologies validation exits non-zero, cannot start, or reports ok != true",
-            "same input/repository/revision produces different TriG bytes",
-            "replay: input or output sha256 differs from this receipt",
-            "emitted semantic subject diverges from semantic-documentation-contract vocabulary",
-        ],
+        falsifiers: FALSIFIERS.to_vec(),
     };
 
     if let Some(parent) = receipt_path.parent()
@@ -185,19 +214,16 @@ pub fn run(options: SemanticDocsOptions) -> Result<SemanticDocumentationReceipt>
 /// count. A validator that cannot be started is recorded as a refusal, never
 /// as a missing receipt.
 fn validate_with_open_ontologies(bin: &Path, graph: &Path) -> ValidationReceipt {
-    let argv = vec![
-        "ontology".to_string(),
-        "validate".to_string(),
-        "--input".to_string(),
-        graph.display().to_string(),
-    ];
+    let mut argv: Vec<String> = VALIDATOR_ARGV_PREFIX
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.push(graph.display().to_string());
     match Command::new(bin).args(&argv).output() {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let (reported_ok, reported_triples) = parse_validator_report(&stdout);
-            let validated = output.status.success()
-                && reported_ok == Some(true)
-                && reported_triples.is_some_and(|n| n > 0);
+            let validated = validation_holds(output.status.code(), reported_ok, reported_triples);
             ValidationReceipt {
                 validator: bin.display().to_string(),
                 argv,
@@ -222,6 +248,16 @@ fn validate_with_open_ontologies(bin: &Path, graph: &Path) -> ValidationReceipt 
             validated: false,
         },
     }
+}
+
+/// The validation predicate, shared by `run` and `replay`: exit 0 AND
+/// `ok == true` AND a non-zero triple count. Each conjunct is load-bearing.
+fn validation_holds(
+    exit_code: Option<i32>,
+    reported_ok: Option<bool>,
+    reported_triples: Option<u64>,
+) -> bool {
+    exit_code == Some(0) && reported_ok == Some(true) && reported_triples.is_some_and(|n| n > 0)
 }
 
 /// Extracts `ok` and `triples` from the last JSON object line on stdout.
@@ -273,25 +309,69 @@ fn refuse_aliasing(input: &Path, output: &Path, receipt: &Path) -> Result<()> {
     let input_id = resolved(input);
     let output_id = resolved(output);
     let receipt_id = resolved(receipt);
-    if output_id == input_id {
+    if output_id == input_id || same_file(output, input) {
         bail!(
             "refused: --output {} aliases the Rustdoc JSON input",
             output.display()
         );
     }
-    if receipt_id == input_id {
+    if receipt_id == input_id || same_file(receipt, input) {
         bail!(
             "refused: --receipt {} aliases the Rustdoc JSON input",
             receipt.display()
         );
     }
-    if receipt_id == output_id {
+    if receipt_id == output_id || same_file(receipt, output) {
         bail!(
             "refused: --receipt {} aliases the --output graph",
             receipt.display()
         );
     }
     Ok(())
+}
+
+/// True when both paths exist and name the same file object (device + inode),
+/// which catches hard links that path canonicalization cannot see.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+/// Records `path` relative to the receipt's directory, so replay resolves it
+/// from the receipt's location instead of the caller's working directory.
+fn receipt_relative(path: &Path, receipt: &Path) -> String {
+    let target = resolved(path);
+    let base = resolved(receipt)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    pathdiff::diff_paths(&target, &base)
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .unwrap_or(target)
+        .display()
+        .to_string()
+}
+
+/// Inverse of `receipt_relative`: absolute paths are kept, relative ones are
+/// joined onto the receipt's own directory.
+fn from_receipt(recorded: &str, receipt: &Path) -> PathBuf {
+    let path = PathBuf::from(recorded);
+    if path.is_absolute() {
+        return path;
+    }
+    resolved(receipt)
+        .parent()
+        .map(|dir| dir.join(&path))
+        .unwrap_or(path)
 }
 
 /// Resolves a path that may not exist yet: canonicalize the deepest existing
@@ -334,18 +414,41 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// How the receipt's validation claim was established during replay.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ValidationReplay {
+    /// The receipt records that no validation was requested.
+    NotRequested,
+    /// The receipt records a failed validation; its recorded exit code and
+    /// report are internally consistent with `validated == false`.
+    RecordedRefusal,
+    /// `validated == true` was reproduced by re-executing the validator the
+    /// replayer supplied against the on-disk graph.
+    Reexecuted { reported_triples: u64 },
+}
+
 /// Outcome of re-executing a receipt against the files it names.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReplayVerdict {
-    /// Input digest, on-disk output digest and recompiled output digest all match.
-    Replayed { output_sha256: String },
+    /// Input digest, on-disk output digest and recompiled output digest all
+    /// match, every deterministic receipt field equals its recomputed value,
+    /// and the validation claim is consistent (re-executed when positive).
+    Replayed {
+        output_sha256: String,
+        validation: ValidationReplay,
+    },
 }
 
-/// Replays a v2 receipt: the input must still hash to `input_sha256`, the
-/// graph on disk must still hash to `output_sha256`, and recompiling the input
+/// Replays a v3 receipt: the input must still hash to `input_sha256`, the
+/// graph on disk must still hash to `output_sha256`, recompiling the input
 /// under the receipt's repository/revision must reproduce `output_sha256`
-/// byte-for-byte. Any divergence is a typed refusal (error).
-pub fn replay(receipt_path: &Path) -> Result<ReplayVerdict> {
+/// byte-for-byte, and every other field the compile determines (extractor,
+/// format version, counts, authority, standing, falsifiers) must equal its
+/// recomputed value. A `validated: true` claim is only accepted when the
+/// replayer supplies an Open Ontologies binary and re-execution reproduces it;
+/// the receipt's own `validator` path is never executed. Relative paths are
+/// resolved against the receipt's directory. Any divergence is a typed refusal.
+pub fn replay(receipt_path: &Path, open_ontologies_bin: Option<&Path>) -> Result<ReplayVerdict> {
     let receipt: Value = serde_json::from_slice(
         &fs::read(receipt_path)
             .with_context(|| format!("failed to read receipt {}", receipt_path.display()))?,
@@ -356,6 +459,9 @@ pub fn replay(receipt_path: &Path) -> Result<ReplayVerdict> {
             receipt_path.display()
         )
     })?;
+    let object = receipt
+        .as_object()
+        .context("REPLAY_REFUSED[RECEIPT_MALFORMED]: receipt is not a JSON object")?;
     let field = |name: &str| -> Result<String> {
         receipt
             .get(name)
@@ -369,8 +475,14 @@ pub fn replay(receipt_path: &Path) -> Result<ReplayVerdict> {
     if schema != RECEIPT_SCHEMA {
         bail!("REPLAY_REFUSED[RECEIPT_SCHEMA]: expected {RECEIPT_SCHEMA}, found {schema}");
     }
-    let input = PathBuf::from(field("input")?);
-    let output = PathBuf::from(field("output")?);
+    if let Some(extra) = object
+        .keys()
+        .find(|key| !RECEIPT_KEYS.contains(&key.as_str()))
+    {
+        bail!("REPLAY_REFUSED[RECEIPT_MALFORMED]: unknown receipt field {extra}");
+    }
+    let input = from_receipt(&field("input")?, receipt_path);
+    let output = from_receipt(&field("output")?, receipt_path);
     let repository = repository_identity(&field("repository")?)?;
     let revision = exact_revision(&field("revision")?)?;
     let expected_input = field("input_sha256")?;
@@ -394,15 +506,145 @@ pub fn replay(receipt_path: &Path) -> Result<ReplayVerdict> {
     }
     let value: Value = serde_json::from_slice(&raw)
         .with_context(|| format!("REPLAY_REFUSED[INPUT_MALFORMED]: {}", input.display()))?;
-    let (trig, _, _) = compile_rustdoc_value(&value, &repository, &revision)?;
+    let (trig, format_version, counts) = compile_rustdoc_value(&value, &repository, &revision)?;
     let recompiled = sha256_hex(trig.as_bytes());
     if recompiled != expected_output {
         bail!(
             "REPLAY_REFUSED[REPLAY_MISMATCH]: receipt {expected_output}, recompiled {recompiled}"
         );
     }
+
+    let recomputed = [
+        ("extractor", Value::from(EXTRACTOR)),
+        ("rustdoc_format_version", Value::from(format_version)),
+        ("item_count", Value::from(counts.item_count)),
+        (
+            "documented_item_count",
+            Value::from(counts.documented_item_count),
+        ),
+        ("reference_count", Value::from(counts.reference_count)),
+        ("source_span_count", Value::from(counts.source_span_count)),
+        ("authority", Value::from(AUTHORITY)),
+        ("standing", Value::from(STANDING)),
+        ("falsifiers", Value::from(FALSIFIERS.to_vec())),
+    ];
+    for (name, expected) in recomputed {
+        let recorded = receipt.get(name).unwrap_or(&Value::Null);
+        if *recorded != expected {
+            bail!(
+                "REPLAY_REFUSED[FIELD_MISMATCH]: {name} receipt {recorded}, recomputed {expected}"
+            );
+        }
+    }
+
+    let validation = replay_validation(
+        receipt.get("validation").unwrap_or(&Value::Null),
+        &output,
+        open_ontologies_bin,
+    )?;
     Ok(ReplayVerdict::Replayed {
         output_sha256: recompiled,
+        validation,
+    })
+}
+
+/// Checks the receipt's validation block. The block must be internally
+/// consistent (its `validated` flag equals the predicate over its own recorded
+/// exit code and stdout report), and a positive claim must be reproduced by
+/// re-executing a replayer-supplied validator on the replayed graph.
+fn replay_validation(
+    block: &Value,
+    graph: &Path,
+    open_ontologies_bin: Option<&Path>,
+) -> Result<ValidationReplay> {
+    const KEYS: [&str; 9] = [
+        "validator",
+        "argv",
+        "requested",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "reported_ok",
+        "reported_triples",
+        "validated",
+    ];
+    let malformed = |what: &str| anyhow::anyhow!("REPLAY_REFUSED[VALIDATION_MALFORMED]: {what}");
+    let block = block
+        .as_object()
+        .ok_or_else(|| malformed("validation is not an object"))?;
+    if let Some(extra) = block.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(malformed(&format!("unknown field {extra}")));
+    }
+    let flag = |name: &str| {
+        block
+            .get(name)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| malformed(&format!("{name} is not a boolean")))
+    };
+    let requested = flag("requested")?;
+    let validated = flag("validated")?;
+    let stdout = block
+        .get("stdout")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("stdout is not a string"))?;
+    let exit_code = match block.get("exit_code") {
+        Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| malformed("exit_code is not an i32 or null"))?,
+        ),
+        None => return Err(malformed("exit_code missing")),
+    };
+    let reported_ok = block.get("reported_ok").and_then(Value::as_bool);
+    let reported_triples = block.get("reported_triples").and_then(Value::as_u64);
+    let (parsed_ok, parsed_triples) = parse_validator_report(stdout);
+    if (reported_ok, reported_triples) != (parsed_ok, parsed_triples) {
+        bail!(
+            "REPLAY_REFUSED[VALIDATION_INCONSISTENT]: reported ok/triples {:?}/{:?} but stdout reports {:?}/{:?}",
+            reported_ok,
+            reported_triples,
+            parsed_ok,
+            parsed_triples
+        );
+    }
+    if validated != validation_holds(exit_code, reported_ok, reported_triples) {
+        bail!(
+            "REPLAY_REFUSED[VALIDATION_INCONSISTENT]: validated={validated} contradicts exit {exit_code:?}, ok {reported_ok:?}, triples {reported_triples:?}"
+        );
+    }
+    if !requested {
+        let argv_empty = block
+            .get("argv")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if validated || exit_code.is_some() || !stdout.is_empty() || !argv_empty {
+            bail!(
+                "REPLAY_REFUSED[VALIDATION_INCONSISTENT]: requested=false but the block records a validator run"
+            );
+        }
+        return Ok(ValidationReplay::NotRequested);
+    }
+    if !validated {
+        return Ok(ValidationReplay::RecordedRefusal);
+    }
+    let Some(bin) = open_ontologies_bin else {
+        bail!(
+            "REPLAY_REFUSED[VALIDATION_NOT_REPLAYED]: receipt claims validated=true; pass --open-ontologies-bin to re-execute it"
+        );
+    };
+    let rerun = validate_with_open_ontologies(bin, graph);
+    if !rerun.validated || rerun.reported_triples != reported_triples {
+        bail!(
+            "REPLAY_REFUSED[VALIDATION_MISMATCH]: receipt validated triples {:?}; re-execution validated={} triples {:?} exit {:?}",
+            reported_triples,
+            rerun.validated,
+            rerun.reported_triples,
+            rerun.exit_code
+        );
+    }
+    Ok(ValidationReplay::Reexecuted {
+        reported_triples: rerun.reported_triples.unwrap_or(0),
     })
 }
 
@@ -654,11 +896,9 @@ fn iri_segment(value: &str) -> String {
             out.push_str(&format!("%{:02X}", byte));
         }
     }
-    if out.is_empty() {
-        "UNKNOWN".to_string()
-    } else {
-        out
-    }
+    // `~` is never emitted by the encoder above (it becomes %7E), so the empty
+    // string gets an IRI segment no non-empty id can produce.
+    if out.is_empty() { "~".to_string() } else { out }
 }
 
 #[cfg(test)]
@@ -733,7 +973,9 @@ mod tests {
     #[test]
     fn iri_segments_are_safe_and_stable() {
         assert_eq!(iri_segment("a/b c"), "a%2Fb%20c");
-        assert_eq!(iri_segment(""), "UNKNOWN");
+        assert_eq!(iri_segment(""), "~");
+        assert_eq!(iri_segment("~"), "%7E");
+        assert_ne!(iri_segment(""), iri_segment("UNKNOWN"));
     }
 }
 
@@ -967,6 +1209,44 @@ mod hardening {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_output_or_receipt_is_refused_and_input_preserved() {
+        let dir = scratch("hardlink");
+        let input = write_input(&dir);
+        let before = fs::read(&input).unwrap();
+        let linked = dir.join("out.trig");
+        fs::hard_link(&input, &linked).unwrap();
+        let err = run(options(&input, &linked)).expect_err("hard-linked output");
+        assert!(
+            err.to_string().contains("aliases the Rustdoc JSON input"),
+            "{err}"
+        );
+        assert_eq!(before, fs::read(&input).unwrap(), "input overwritten");
+
+        let receipt_link = dir.join("r.json");
+        fs::hard_link(&input, &receipt_link).unwrap();
+        let mut opts = options(&input, &dir.join("g.trig"));
+        opts.receipt = Some(receipt_link);
+        assert!(run(opts).is_err(), "hard-linked receipt");
+        assert_eq!(before, fs::read(&input).unwrap(), "input overwritten");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_and_unknown_ids_get_distinct_iris() {
+        let trig = compile(&json!({
+            "format_version": 61,
+            "index": {"": {"inner": {"module": {}}}, "UNKNOWN": {"inner": {"module": {}}}}
+        }));
+        let subjects: Vec<&str> = trig
+            .lines()
+            .filter(|l| l.contains("> a sdoc:RustItem"))
+            .collect();
+        assert_eq!(subjects.len(), 2, "{trig}");
+        assert_ne!(subjects[0], subjects[1], "IRI collision: {subjects:?}");
+    }
+
     // ---- digests + replay -------------------------------------------------
 
     #[test]
@@ -996,9 +1276,10 @@ mod hardening {
         let receipt_path = dir.join("g.trig.receipt.json");
         let receipt = run(options(&input, &output)).expect("run");
         assert_eq!(
-            replay(&receipt_path).expect("clean replay"),
+            replay(&receipt_path, None).expect("clean replay"),
             ReplayVerdict::Replayed {
-                output_sha256: receipt.output_sha256.clone()
+                output_sha256: receipt.output_sha256.clone(),
+                validation: ValidationReplay::NotRequested,
             }
         );
 
@@ -1006,7 +1287,7 @@ mod hardening {
         let original_graph = fs::read(&output).unwrap();
         let original_input = fs::read(&input).unwrap();
         let refused = |tag: &str| {
-            let err = replay(&receipt_path).expect_err(tag).to_string();
+            let err = replay(&receipt_path, None).expect_err(tag).to_string();
             assert!(err.contains(tag), "expected {tag}, got {err}");
         };
 
@@ -1038,11 +1319,16 @@ mod hardening {
         fs::write(&receipt_path, serde_json::to_vec(&forged).unwrap()).unwrap();
         refused("exact revision");
 
-        // schema downgrade (v1 receipts carry no digests)
-        let mut forged: Value = serde_json::from_slice(&original_receipt).unwrap();
-        forged["schema_version"] = json!("litho.semantic-documentation.receipt/v1");
-        fs::write(&receipt_path, serde_json::to_vec(&forged).unwrap()).unwrap();
-        refused("RECEIPT_SCHEMA");
+        // schema downgrade (v1 carries no digests; v2 paths were cwd-relative)
+        for old in [
+            "litho.semantic-documentation.receipt/v1",
+            "litho.semantic-documentation.receipt/v2",
+        ] {
+            let mut forged: Value = serde_json::from_slice(&original_receipt).unwrap();
+            forged["schema_version"] = json!(old);
+            fs::write(&receipt_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+            refused("RECEIPT_SCHEMA");
+        }
 
         // digest field removed
         let mut forged: Value = serde_json::from_slice(&original_receipt).unwrap();
@@ -1055,9 +1341,169 @@ mod hardening {
 
         fs::write(&receipt_path, &original_receipt).unwrap();
         assert!(
-            replay(&receipt_path).is_ok(),
+            replay(&receipt_path, None).is_ok(),
             "restored receipt must replay again"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Every field the compile determines is recomputed on replay; a receipt
+    /// whose digests are intact but whose claims are forged is refused.
+    #[test]
+    fn replay_refuses_forged_authority_standing_counts_and_validation() {
+        let dir = scratch("forge");
+        let input = write_input(&dir);
+        let output = dir.join("g.trig");
+        let receipt_path = dir.join("g.trig.receipt.json");
+        run(options(&input, &output)).expect("run");
+        let original: Value = receipt_json(&receipt_path);
+        let replay_err = |forged: &Value| {
+            fs::write(&receipt_path, serde_json::to_vec(forged).unwrap()).unwrap();
+            replay(&receipt_path, None)
+                .expect_err("forged receipt must not replay")
+                .to_string()
+        };
+        let forge = |edit: &dyn Fn(&mut Value)| {
+            let mut forged = original.clone();
+            edit(&mut forged);
+            forged
+        };
+
+        // The exact forgery from the court (A5), all at once.
+        let a5 = forge(&|r| {
+            r["authority"] = json!("DO");
+            r["standing"] = json!("ALIVE");
+            r["validation"]["validated"] = json!(true);
+            r["item_count"] = json!(999_999);
+        });
+        assert!(replay_err(&a5).contains("REPLAY_REFUSED["), "A5 replayed");
+
+        for (name, forged_value) in [
+            ("authority", json!("DO")),
+            ("standing", json!("ALIVE")),
+            ("item_count", json!(999_999)),
+            ("documented_item_count", json!(0)),
+            ("reference_count", json!(1)),
+            ("source_span_count", json!("12")),
+            ("rustdoc_format_version", json!(1)),
+            ("extractor", json!("prose")),
+            ("falsifiers", json!([])),
+        ] {
+            let err = replay_err(&forge(&|r| r[name] = forged_value.clone()));
+            assert!(
+                err.contains("FIELD_MISMATCH") && err.contains(name),
+                "{name}: {err}"
+            );
+        }
+        let err = replay_err(&forge(&|r| {
+            r.as_object_mut().unwrap().remove("standing");
+        }));
+        assert!(err.contains("FIELD_MISMATCH"), "{err}");
+        let err = replay_err(&forge(&|r| r["authority_override"] = json!("DO")));
+        assert!(err.contains("unknown receipt field"), "{err}");
+
+        // validated=true without a validator run is internally inconsistent.
+        let err = replay_err(&forge(&|r| r["validation"]["validated"] = json!(true)));
+        assert!(err.contains("VALIDATION_INCONSISTENT"), "{err}");
+        // A fully consistent forged positive claim still needs re-execution.
+        let claimed = forge(&|r| {
+            r["validation"] = json!({
+                "validator": "/usr/bin/true", "argv": ["ontology", "validate", "--input", "g.trig"],
+                "requested": true, "exit_code": 0, "stdout": "{\"ok\":true,\"triples\":42}\n",
+                "stderr": "", "reported_ok": true, "reported_triples": 42, "validated": true
+            });
+        });
+        let err = replay_err(&claimed);
+        assert!(err.contains("VALIDATION_NOT_REPLAYED"), "{err}");
+        // reported_ok disagreeing with its own stdout is refused.
+        let err = replay_err(&forge(&|r| {
+            r["validation"] = claimed["validation"].clone();
+            r["validation"]["reported_triples"] = json!(43);
+        }));
+        assert!(err.contains("VALIDATION_INCONSISTENT"), "{err}");
+        // A positive record flipped to a refusal contradicts its own report.
+        let err = replay_err(&forge(&|r| {
+            r["validation"] = claimed["validation"].clone();
+            r["validation"]["validated"] = json!(false);
+        }));
+        assert!(err.contains("VALIDATION_INCONSISTENT"), "{err}");
+        // requested=false with a recorded validator run is refused.
+        let err = replay_err(&forge(&|r| {
+            r["validation"]["exit_code"] = json!(3);
+            r["validation"]["stdout"] = json!("validator ran\n");
+        }));
+        assert!(err.contains("VALIDATION_INCONSISTENT"), "{err}");
+        let err = replay_err(&forge(&|r| r["validation"]["verdict"] = json!("ok")));
+        assert!(err.contains("VALIDATION_MALFORMED"), "{err}");
+
+        #[cfg(unix)]
+        {
+            fs::write(&receipt_path, serde_json::to_vec(&claimed).unwrap()).unwrap();
+            let refusing = validator(&dir, "refuse.sh", r#"echo '{"ok":false,"triples":0}'"#);
+            let err = replay(&receipt_path, Some(&refusing))
+                .expect_err("re-execution disagrees")
+                .to_string();
+            assert!(err.contains("VALIDATION_MISMATCH"), "{err}");
+            let agreeing = validator(
+                &dir,
+                "agree.sh",
+                r#"[ "$1 $2 $3" = "ontology validate --input" ] && [ -f "$4" ] || exit 9; echo '{"ok":true,"triples":42}'"#,
+            );
+            assert_eq!(
+                replay(&receipt_path, Some(&agreeing)).expect("re-executed claim"),
+                ReplayVerdict::Replayed {
+                    output_sha256: original["output_sha256"].as_str().unwrap().to_string(),
+                    validation: ValidationReplay::Reexecuted {
+                        reported_triples: 42
+                    },
+                }
+            );
+        }
+
+        fs::write(&receipt_path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(replay(&receipt_path, None).is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Receipt paths are relative to the receipt, so replay does not depend on
+    /// the caller's working directory: the whole bundle can be moved.
+    #[test]
+    fn receipt_paths_resolve_from_the_receipt_not_the_cwd() {
+        let dir = scratch("reloc");
+        let bundle = dir.join("a").join("b");
+        fs::create_dir_all(bundle.join("out")).unwrap();
+        let input = write_input(&bundle);
+        let output = bundle.join("out").join("g.trig");
+        let mut opts = options(&input, &output);
+        opts.receipt = Some(bundle.join("receipts").join("r.json"));
+        run(opts).expect("run");
+        let receipt = receipt_json(&bundle.join("receipts").join("r.json"));
+        assert_eq!(
+            receipt["input"],
+            json!(format!("..{}in.json", std::path::MAIN_SEPARATOR))
+        );
+        assert_eq!(
+            receipt["output"],
+            json!(
+                Path::new("..")
+                    .join("out")
+                    .join("g.trig")
+                    .display()
+                    .to_string()
+            )
+        );
+
+        let moved = dir.join("elsewhere");
+        fs::rename(&bundle, &moved).unwrap();
+        assert!(
+            replay(&moved.join("receipts").join("r.json"), None).is_ok(),
+            "relocated bundle must replay"
+        );
+        fs::remove_file(moved.join("in.json")).unwrap();
+        let err = replay(&moved.join("receipts").join("r.json"), None)
+            .expect_err("missing input")
+            .to_string();
+        assert!(err.contains("INPUT_MISSING"), "{err}");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1086,6 +1532,11 @@ mod hardening {
             (
                 "zero-exit-not-ok.sh",
                 r#"echo '{"ok":false,"triples":0,"error":"Parser error"}'"#,
+                false,
+            ),
+            (
+                "zero-exit-not-ok-with-triples.sh",
+                r#"echo '{"ok":false,"triples":42}'"#,
                 false,
             ),
             (
@@ -1149,14 +1600,15 @@ mod hardening {
         })
     }
 
+    /// Real-validator leg. It is a named ignored test so an absent binary is a
+    /// visible `ignored` in the test count, never a silent pass; run it with
+    /// `cargo test -- --ignored` where open-ontologies is installed.
     #[test]
+    #[ignore = "needs open-ontologies on PATH or OPEN_ONTOLOGIES_BIN; run with --ignored"]
     fn installed_open_ontologies_validates_real_graph_and_refuses_corruption() {
-        let Some(bin) = installed_open_ontologies() else {
-            eprintln!(
-                "SKIPPED(open-ontologies not on PATH and OPEN_ONTOLOGIES_BIN unset): real-validator leg not run"
-            );
-            return;
-        };
+        let bin = installed_open_ontologies().expect(
+            "open-ontologies not on PATH and OPEN_ONTOLOGIES_BIN unset: real-validator leg cannot run",
+        );
         let dir = scratch("real-oo");
         let input = write_input(&dir);
         let output = dir.join("g.trig");
@@ -1172,6 +1624,22 @@ mod hardening {
         assert_eq!(
             receipt.standing, "PARTIAL_ALIVE",
             "validate never upgrades standing"
+        );
+        let receipt_path = dir.join("g.trig.receipt.json");
+        assert!(
+            replay(&receipt_path, None)
+                .expect_err("positive claim needs re-execution")
+                .to_string()
+                .contains("VALIDATION_NOT_REPLAYED")
+        );
+        assert_eq!(
+            replay(&receipt_path, Some(&bin)).expect("real re-execution"),
+            ReplayVerdict::Replayed {
+                output_sha256: receipt.output_sha256.clone(),
+                validation: ValidationReplay::Reexecuted {
+                    reported_triples: receipt.validation.reported_triples.unwrap()
+                },
+            }
         );
 
         // Anti-vacuity against the real binary: a corrupted graph is refused.
@@ -1243,11 +1711,40 @@ mod hardening {
         json!({"root": 0, "format_version": 61, "index": index, "paths": paths})
     }
 
-    /// Regression bound for the unoptimized test profile the CI workflow uses:
+    /// Deterministic scaling check that runs in the default suite: counts and
+    /// linear output growth, plus a 20 s ceiling that only a super-linear
+    /// regression (not runner load) can reach. The tight wall-clock bound is
+    /// the ignored `compile_throughput_regression_bound`.
+    #[test]
+    fn compile_scales_linearly() {
+        let (small_trig, _, _) =
+            compile_rustdoc_value(&synthetic(1_000), "acme/bench", REV).unwrap();
+        let start = Instant::now();
+        let (trig, _, counts) =
+            compile_rustdoc_value(&synthetic(5_000), "acme/bench", REV).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(counts.item_count, 5_000);
+        assert_eq!(counts.reference_count, 10_000);
+        assert_eq!(counts.source_span_count, 5_000);
+        let ratio = trig.len() as f64 / small_trig.len() as f64;
+        assert!(
+            (4.5..5.5).contains(&ratio),
+            "output growth not linear: {ratio}"
+        );
+        assert!(
+            elapsed.as_secs_f64() < 20.0,
+            "super-linear: 5000 items took {elapsed:?}"
+        );
+    }
+
+    /// Wall-clock regression bound for the unoptimized test profile:
     /// 5,000 fully-populated items (docs, span, 2 links, path) must compile in
     /// under 2.5 s (measured 218-496 ms across 5 loaded runs on an M-series
-    /// host; see tests/fixtures/semantic/BENCH.md). Output size scales linearly.
+    /// host; see tests/fixtures/semantic/BENCH.md). Ignored by default because
+    /// a wall-clock assertion flakes on loaded runners; run it with
+    /// `cargo test compile_throughput -- --ignored --nocapture`.
     #[test]
+    #[ignore = "wall-clock bound; run with --ignored on a quiet host"]
     fn compile_throughput_regression_bound() {
         let small = synthetic(1_000);
         let large = synthetic(5_000);

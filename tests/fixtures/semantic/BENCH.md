@@ -7,8 +7,11 @@ Revision under test: the `semantic-docs` hardening commit on `feat/semantic-docu
 ## In-process compile (regression bound test)
 
 `semantic::hardening::compile_throughput_regression_bound` compiles 5,000 fully populated items.
-Each item has docs, a span, two links and a path. Five runs of
-`cargo test compile_throughput -- --nocapture` printed:
+Each item has docs, a span, two links and a path. It is an ignored test, because a wall-clock
+assertion can flake on a loaded CI runner. The default suite runs `compile_scales_linearly`
+instead: exact counts, linear output growth and a 20 s ceiling that only a super-linear
+regression can reach. Five runs of `cargo test compile_throughput -- --ignored --nocapture`
+printed:
 
 | run | elapsed_ms | items/s |
 |---|---|---|

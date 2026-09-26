@@ -153,11 +153,16 @@ pub enum Commands {
         open_ontologies_bin: Option<PathBuf>,
     },
 
-    /// Replay a semantic-docs receipt: re-hash input/output and recompile byte-for-byte.
+    /// Replay a semantic-docs receipt: re-hash input/output, recompile byte-for-byte, recheck every field.
     SemanticDocsReplay {
-        /// Receipt written by `semantic-docs` (schema litho.semantic-documentation.receipt/v2).
+        /// Receipt written by `semantic-docs` (schema litho.semantic-documentation.receipt/v3).
         #[arg(long)]
         receipt: PathBuf,
+
+        /// Open Ontologies binary used to re-execute a `validated: true` claim. Required when the
+        /// receipt claims successful validation; the receipt's recorded validator path is never run.
+        #[arg(long)]
+        open_ontologies_bin: Option<PathBuf>,
     },
 }
 
